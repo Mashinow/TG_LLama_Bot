@@ -1,7 +1,9 @@
 import asyncio
 from dataclasses import dataclass
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.utils.backoff import BackoffConfig
@@ -21,13 +23,21 @@ from tg_llama_bot.models import (
 class VisionUnavailableError(ValueError):
     """The selected model does not advertise image input support."""
 
-START_TEXT = "Бот запущен. Отправьте текстовое сообщение, чтобы обратиться к модели."
-HELP_TEXT = "Доступны текстовые сообщения и команда /reset для очистки истории."
+START_TEXT = "Бот запущен. Отправьте текст или изображение, чтобы обратиться к модели."
+HELP_TEXT = (
+    "Доступны текст, фотографии и изображения-документы. "
+    "Команда /reset очищает историю."
+)
 RESET_TEXT = "История этого чата очищена."
 ACCESS_DENIED_TEXT = "Доступ к боту запрещён."
-UNSUPPORTED_TEXT = "Поддерживаются только текстовые сообщения."
+UNSUPPORTED_TEXT = "Поддерживаются текст, фотографии и изображения-документы."
 INPUT_TOO_LONG_TEXT = "Сообщение слишком длинное для контекста модели."
 UPSTREAM_ERROR_TEXT = "Модель временно недоступна. Попробуйте позже."
+DEFAULT_IMAGE_PROMPT = "Опиши изображение."
+VISION_UNAVAILABLE_TEXT = "Текущая модель не поддерживает анализ изображений."
+IMAGE_TOO_LARGE_TEXT = "Изображение слишком большое. Максимальный размер — 10 МиБ."
+IMAGE_DOWNLOAD_ERROR_TEXT = "Не удалось загрузить изображение. Попробуйте отправить его снова."
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def is_allowed(user_id: int | None, allowed_user_ids: tuple[int, ...]) -> bool:
@@ -141,6 +151,70 @@ class BotHandlers:
         for part in split_telegram_text(answer):
             await message.answer(part)
 
+    async def image(self, message: Message) -> None:
+        if not await self._authorize(message):
+            return
+
+        downloadable: object | None = None
+        media_type: str | None = None
+        if message.photo:
+            downloadable = message.photo[-1]
+            media_type = "image/jpeg"
+        elif message.document is not None:
+            document_media_type = message.document.mime_type
+            if isinstance(document_media_type, str) and document_media_type.startswith(
+                "image/"
+            ):
+                downloadable = message.document
+                media_type = document_media_type
+
+        if downloadable is None or media_type is None:
+            await message.answer(UNSUPPORTED_TEXT)
+            return
+
+        reported_size = getattr(downloadable, "file_size", None)
+        if isinstance(reported_size, int) and reported_size > MAX_IMAGE_BYTES:
+            await message.answer(IMAGE_TOO_LARGE_TEXT)
+            return
+
+        destination = BytesIO()
+        try:
+            await message.bot.download(downloadable, destination=destination)
+        except (TelegramAPIError, OSError):
+            await message.answer(IMAGE_DOWNLOAD_ERROR_TEXT)
+            return
+
+        image_data = destination.getvalue()
+        if len(image_data) > MAX_IMAGE_BYTES:
+            await message.answer(IMAGE_TOO_LARGE_TEXT)
+            return
+        if not image_data:
+            await message.answer(IMAGE_DOWNLOAD_ERROR_TEXT)
+            return
+
+        prompt = (
+            message.caption
+            if isinstance(message.caption, str) and message.caption.strip()
+            else DEFAULT_IMAGE_PROMPT
+        )
+        try:
+            answer = await self._service.answer(
+                message.chat.id,
+                prompt,
+                images=(ImageAttachment(media_type, image_data),),
+            )
+        except VisionUnavailableError:
+            await message.answer(VISION_UNAVAILABLE_TEXT)
+            return
+        except InputTooLongError:
+            await message.answer(INPUT_TOO_LONG_TEXT)
+            return
+        except LlamaError:
+            await message.answer(UPSTREAM_ERROR_TEXT)
+            return
+        for part in split_telegram_text(answer):
+            await message.answer(part)
+
     async def unsupported(self, message: Message) -> None:
         if await self._authorize(message):
             await message.answer(UNSUPPORTED_TEXT)
@@ -172,6 +246,7 @@ def build_dispatcher(dependencies: BotDependencies) -> Dispatcher:
     dispatcher.message.register(handlers.start, Command("start"))
     dispatcher.message.register(handlers.help, Command("help"))
     dispatcher.message.register(handlers.reset, Command("reset"))
+    dispatcher.message.register(handlers.image, F.photo | F.document)
     dispatcher.message.register(handlers.text, F.text)
     dispatcher.message.register(handlers.unsupported)
     return dispatcher
