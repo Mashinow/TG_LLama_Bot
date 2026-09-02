@@ -3,9 +3,10 @@ import math
 from collections.abc import Awaitable, Callable
 
 from tg_llama_bot.llama_client import LlamaConnectionError, LlamaProtocolError
-from tg_llama_bot.models import ChatMessage
+from tg_llama_bot.models import ChatMessage, ImageAttachment
 
 TokenCounter = Callable[[str], Awaitable[int]]
+IMAGE_TOKEN_ESTIMATE = 2048
 
 
 class InputTooLongError(ValueError):
@@ -30,10 +31,11 @@ class HistoryStore:
         user_text: str,
         token_counter: TokenCounter,
         prompt_budget: int,
+        images: tuple[ImageAttachment, ...] = (),
     ) -> list[ChatMessage]:
         candidate = [
             *self._histories.get(chat_id, ()),
-            ChatMessage("user", user_text),
+            ChatMessage("user", user_text, images),
         ]
         use_fallback = False
 
@@ -43,16 +45,22 @@ class HistoryStore:
                 f"{message.role}\n{message.content}\n" for message in messages
             )
             if use_fallback:
-                return conservative_token_estimate(serialized)
+                text_tokens = conservative_token_estimate(serialized)
+                return text_tokens + sum(
+                    len(message.images) * IMAGE_TOKEN_ESTIMATE for message in messages
+                )
             try:
-                return await token_counter(serialized)
+                text_tokens = await token_counter(serialized)
             except (LlamaConnectionError, LlamaProtocolError):
                 use_fallback = True
                 if self._warning_callback is not None:
                     self._warning_callback(
                         "Tokenization unavailable; using conservative estimate."
                     )
-                return conservative_token_estimate(serialized)
+                text_tokens = conservative_token_estimate(serialized)
+            return text_tokens + sum(
+                len(message.images) * IMAGE_TOKEN_ESTIMATE for message in messages
+            )
 
         newest = [candidate[-1]]
         if prompt_budget <= 0 or await count(newest) > prompt_budget:
@@ -62,11 +70,17 @@ class HistoryStore:
             candidate = candidate[2:]
         return candidate
 
-    def commit(self, chat_id: int, user_text: str, assistant_text: str) -> None:
+    def commit(
+        self,
+        chat_id: int,
+        user_text: str,
+        assistant_text: str,
+        images: tuple[ImageAttachment, ...] = (),
+    ) -> None:
         history = self._histories.setdefault(chat_id, [])
         history.extend(
             (
-                ChatMessage("user", user_text),
+                ChatMessage("user", user_text, images),
                 ChatMessage("assistant", assistant_text),
             )
         )

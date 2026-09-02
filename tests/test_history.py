@@ -2,7 +2,9 @@ import pytest
 
 from tg_llama_bot.history import HistoryStore, InputTooLongError
 from tg_llama_bot.llama_client import LlamaConnectionError
-from tg_llama_bot.models import ChatMessage
+from tg_llama_bot.models import ChatMessage, ImageAttachment
+
+IMAGE = ImageAttachment("image/jpeg", b"image-bytes")
 
 
 async def character_counter(content: str) -> int:
@@ -28,6 +30,26 @@ async def test_prepare_trims_oldest_complete_exchange() -> None:
     store.commit(1, "12345", "67890")
     messages = await store.prepare(1, "abc", character_counter, 9)
     assert messages == [ChatMessage("user", "abc")]
+
+
+@pytest.mark.asyncio
+async def test_prepare_retains_image_in_later_turns() -> None:
+    store = HistoryStore()
+    store.commit(1, "describe", "a cat", images=(IMAGE,))
+    messages = await store.prepare(1, "what color?", character_counter, 10_000)
+    assert messages == [
+        ChatMessage("user", "describe", (IMAGE,)),
+        ChatMessage("assistant", "a cat"),
+        ChatMessage("user", "what color?"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_trims_complete_exchange_with_image() -> None:
+    store = HistoryStore()
+    store.commit(1, "describe", "a cat", images=(IMAGE,))
+    messages = await store.prepare(1, "next", character_counter, 100)
+    assert messages == [ChatMessage("user", "next")]
 
 
 @pytest.mark.asyncio

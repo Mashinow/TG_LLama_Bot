@@ -15,6 +15,7 @@ from tg_llama_bot.bot import (
     UPSTREAM_ERROR_TEXT,
     BotHandlers,
     ChatService,
+    VisionUnavailableError,
     is_allowed,
     run_bot,
     split_telegram_text,
@@ -24,6 +25,7 @@ from tg_llama_bot.llama_client import LlamaConnectionError
 from tg_llama_bot.models import (
     AppConfig,
     ChatMessage,
+    ImageAttachment,
     RuntimeEvent,
     RuntimeState,
     ServerCapabilities,
@@ -37,6 +39,17 @@ CAPABILITIES = ServerCapabilities(
     reasoning_format="none",
     modalities=("text",),
 )
+
+VISION_CAPABILITIES = ServerCapabilities(
+    model_id="vision.gguf",
+    n_ctx=4096,
+    max_output_tokens=512,
+    server_max_output_tokens=512,
+    reasoning_format="none",
+    modalities=("text", "vision"),
+)
+
+IMAGE = ImageAttachment("image/jpeg", b"image-bytes")
 
 
 async def character_counter(content: str) -> int:
@@ -152,6 +165,29 @@ async def test_chat_service_does_not_commit_failed_exchange() -> None:
     assert await history.prepare(10, "next", character_counter, 1000) == [
         ChatMessage("user", "next")
     ]
+
+
+@pytest.mark.asyncio
+async def test_chat_service_retains_image_for_follow_up() -> None:
+    llama = FakeLlama()
+    history = HistoryStore()
+    service = ChatService(llama, VISION_CAPABILITIES, history)
+    await service.answer(10, "describe", images=(IMAGE,))
+    await service.answer(10, "what color?")
+    assert llama.completed_messages[1] == [
+        ChatMessage("user", "describe", (IMAGE,)),
+        ChatMessage("assistant", "model answer"),
+        ChatMessage("user", "what color?"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_service_rejects_image_when_model_has_no_vision() -> None:
+    llama = FakeLlama()
+    service = ChatService(llama, CAPABILITIES, HistoryStore())
+    with pytest.raises(VisionUnavailableError):
+        await service.answer(10, "describe", images=(IMAGE,))
+    assert llama.completed_messages == []
 
 
 @pytest.mark.asyncio

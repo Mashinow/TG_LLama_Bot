@@ -11,10 +11,15 @@ from tg_llama_bot.llama_client import LlamaClient, LlamaError
 from tg_llama_bot.models import (
     AppConfig,
     EventSink,
+    ImageAttachment,
     RuntimeEvent,
     RuntimeState,
     ServerCapabilities,
 )
+
+
+class VisionUnavailableError(ValueError):
+    """The selected model does not advertise image input support."""
 
 START_TEXT = "Бот запущен. Отправьте текстовое сообщение, чтобы обратиться к модели."
 HELP_TEXT = "Доступны текстовые сообщения и команда /reset для очистки истории."
@@ -64,7 +69,14 @@ class ChatService:
         self._capabilities = capabilities
         self._history = history
 
-    async def answer(self, chat_id: int, text: str) -> str:
+    async def answer(
+        self,
+        chat_id: int,
+        text: str,
+        images: tuple[ImageAttachment, ...] = (),
+    ) -> str:
+        if images and "vision" not in self._capabilities.modalities:
+            raise VisionUnavailableError
         async with self._history.lock_for(chat_id):
             prompt_budget = (
                 self._capabilities.n_ctx
@@ -76,13 +88,14 @@ class ChatService:
                 text,
                 self._llama.count_tokens,
                 prompt_budget,
+                images,
             )
             answer = await self._llama.complete(
                 self._capabilities.model_id,
                 messages,
                 self._capabilities.max_output_tokens,
             )
-            self._history.commit(chat_id, text, answer)
+            self._history.commit(chat_id, text, answer, images)
             return answer
 
 
