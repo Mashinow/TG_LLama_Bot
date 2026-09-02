@@ -10,7 +10,7 @@ from tg_llama_bot.llama_client import (
     LlamaProtocolError,
     RetryPolicy,
 )
-from tg_llama_bot.models import ChatMessage
+from tg_llama_bot.models import ChatMessage, ImageAttachment
 
 
 @pytest.mark.asyncio
@@ -165,6 +165,54 @@ async def test_complete_sends_chat_contract_and_returns_content() -> None:
     answer = await client.complete(
         "model.gguf",
         [ChatMessage("user", "hello")],
+        128,
+    )
+    assert answer == "answer"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_complete_sends_images_as_data_url_content_parts() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content) == {
+            "model": "model.gguf",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/jpeg;base64,aW1hZ2UtYnl0ZXM="
+                            },
+                        },
+                        {"type": "text", "text": "describe"},
+                    ],
+                }
+            ],
+            "max_tokens": 128,
+            "stream": False,
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "answer"}}]},
+        )
+
+    http = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = LlamaClient("http://test", http_client=http)
+    answer = await client.complete(
+        "model.gguf",
+        [
+            ChatMessage(
+                "user",
+                "describe",
+                (ImageAttachment("image/jpeg", b"image-bytes"),),
+            )
+        ],
         128,
     )
     assert answer == "answer"

@@ -12,9 +12,16 @@ class AppConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageAttachment:
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Literal["user", "assistant"]
     content: str
+    images: tuple[ImageAttachment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

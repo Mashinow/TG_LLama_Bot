@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -133,10 +134,7 @@ class LlamaClient:
             "/v1/chat/completions",
             json={
                 "model": model_id,
-                "messages": [
-                    {"role": message.role, "content": message.content}
-                    for message in messages
-                ],
+                "messages": [self._serialize_message(message) for message in messages],
                 "max_tokens": max_tokens,
                 "stream": False,
             },
@@ -152,6 +150,26 @@ class LlamaClient:
         if not isinstance(content, str) or not content.strip():
             raise LlamaProtocolError("llama-server вернул пустой ответ.")
         return content
+
+    @staticmethod
+    def _serialize_message(message: ChatMessage) -> dict[str, Any]:
+        if not message.images:
+            return {"role": message.role, "content": message.content}
+
+        content: list[dict[str, Any]] = []
+        for attachment in message.images:
+            encoded = base64.b64encode(attachment.data).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{attachment.media_type};base64,{encoded}"
+                    },
+                }
+            )
+        if message.content:
+            content.append({"type": "text", "text": message.content})
+        return {"role": message.role, "content": content}
 
     async def aclose(self) -> None:
         if not self._http.is_closed:
