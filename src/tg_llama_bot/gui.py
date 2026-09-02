@@ -1,4 +1,5 @@
 import queue
+import sys
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -26,6 +27,13 @@ class ControlState:
     start_enabled: bool
     stop_enabled: bool
     fields_enabled: bool
+
+
+def handle_windows_entry_shortcut(event: tk.Event) -> str | None:
+    if event.keycode != 0x56:
+        return None
+    event.widget.event_generate("<<Paste>>")
+    return "break"
 
 
 def controls_for_state(state: RuntimeState) -> ControlState:
@@ -94,6 +102,13 @@ class BotWindow:
         )
         self.allowed_entry = ttk.Entry(settings, textvariable=self.allowed_var)
         self.allowed_entry.grid(row=2, column=1, pady=4, sticky="ew")
+        if sys.platform == "win32":
+            for entry in (self.token_entry, self.url_entry, self.allowed_entry):
+                entry.bind(
+                    "<Control-KeyPress>",
+                    handle_windows_entry_shortcut,
+                    add="+",
+                )
 
         buttons = ttk.Frame(self.root, padding=(10, 5))
         buttons.grid(row=1, column=0, sticky="ew")

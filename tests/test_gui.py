@@ -1,10 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 import tg_llama_bot.app as app_module
-from tg_llama_bot.gui import controls_for_state
+from tg_llama_bot.gui import controls_for_state, handle_windows_entry_shortcut
 from tg_llama_bot.models import RuntimeState
 
 
@@ -28,6 +29,20 @@ def test_controls_follow_runtime_state(
     assert controls.start_enabled is start
     assert controls.stop_enabled is stop
     assert controls.fields_enabled is fields
+
+
+def test_physical_ctrl_v_generates_one_paste_event() -> None:
+    widget = Mock()
+    event = SimpleNamespace(keycode=86, widget=widget)
+    assert handle_windows_entry_shortcut(event) == "break"
+    widget.event_generate.assert_called_once_with("<<Paste>>")
+
+
+def test_other_ctrl_key_is_left_to_tkinter() -> None:
+    widget = Mock()
+    event = SimpleNamespace(keycode=66, widget=widget)
+    assert handle_windows_entry_shortcut(event) is None
+    widget.event_generate.assert_not_called()
 
 
 def test_main_constructs_window_and_enters_mainloop(
