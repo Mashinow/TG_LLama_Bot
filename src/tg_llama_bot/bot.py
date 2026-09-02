@@ -187,6 +187,7 @@ async def run_bot(
         stop_waiter: asyncio.Task[bool] | None = None
         try:
             await telegram_bot.get_me()
+            await telegram_bot.delete_webhook(drop_pending_updates=False)
             dispatcher = build_dispatcher(
                 BotDependencies(config, capabilities, llama, history)
             )

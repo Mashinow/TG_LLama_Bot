@@ -231,12 +231,17 @@ async def test_command_and_unsupported_handlers_return_helpful_text() -> None:
 class FakeBot:
     def __init__(self) -> None:
         self.validated = False
+        self.webhook_delete_calls: list[bool] = []
         self.closed = False
         self.session = SimpleNamespace(close=self.close)
 
     async def get_me(self) -> SimpleNamespace:
         self.validated = True
         return SimpleNamespace(username="test_bot")
+
+    async def delete_webhook(self, *, drop_pending_updates: bool) -> bool:
+        self.webhook_delete_calls.append(drop_pending_updates)
+        return True
 
     async def close(self) -> None:
         self.closed = True
@@ -275,6 +280,7 @@ async def test_run_bot_discovers_validates_polls_and_closes(
     await asyncio.wait_for(task, timeout=1)
 
     assert telegram_bot.validated
+    assert telegram_bot.webhook_delete_calls == [False]
     assert telegram_bot.closed
     assert llama.exited
     assert RuntimeEvent("capabilities", CAPABILITIES) in events
