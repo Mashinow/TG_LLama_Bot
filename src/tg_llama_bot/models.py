@@ -1,4 +1,6 @@
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
 
@@ -23,3 +25,20 @@ class ServerCapabilities:
     server_max_output_tokens: int | None
     reasoning_format: str
     modalities: tuple[str, ...]
+
+
+class RuntimeState(str, Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeEvent:
+    kind: Literal["state", "log", "capabilities", "error"]
+    payload: object
+
+
+type EventSink = Callable[[RuntimeEvent], None]
