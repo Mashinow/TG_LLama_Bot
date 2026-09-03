@@ -26,23 +26,22 @@ Python is not required when using the packaged executable from a release.
 ## Run the Release Executable
 
 1. Download `tg-llama-bot.exe` from the Releases page of this repository.
-2. Copy `config.example.yaml` to `config.yaml` in the same directory as the executable.
-3. Add your Telegram bot token to `config.yaml`.
-4. Start `tg-llama-bot.exe` from that directory.
-5. Click **Start** and wait for the running status.
+2. Start `tg-llama-bot.exe`.
+3. Enter the Telegram token and other settings in the desktop interface.
+4. Click **Save**, then click **Start** and wait for the running status.
 
-The application reads `config.yaml` from its current working directory. Keep the configuration file private because it contains the Telegram token.
+The executable creates its local configuration automatically. All configuration changes are made through the desktop interface.
 
 ## Run from Source
 
-You may use any supported environment manager or an existing Python environment. Install the project dependencies, create the local configuration, and start the application:
+You may use any supported environment manager or an existing Python environment. Install the project dependencies and start the application:
 
 ```text
 python -m pip install -e .
 python -m tg_llama_bot.app
 ```
 
-Before the first run, copy `config.example.yaml` to `config.yaml` and enter your Telegram bot token.
+Enter the Telegram token and other settings in the desktop interface, click **Save**, and then start the bot.
 
 ## Build the One-File Executable
 
@@ -57,19 +56,13 @@ The build output is `dist/tg-llama-bot.exe`. The executable bundles the Python r
 
 ## Configuration
 
-`config.yaml` contains three fields:
-
-```yaml
-telegram_token: "TOKEN_FROM_BOTFATHER"
-llama_base_url: "http://127.0.0.1:8080"
-allowed_user_ids: []
-```
+Configuration is created and edited through the desktop interface. It contains three settings:
 
 - `telegram_token` is required before the bot can start.
 - `llama_base_url` defaults to the local llama-server address.
 - An empty `allowed_user_ids` list allows everyone to use the bot. A list such as `[123456789]` restricts access to those Telegram user IDs.
 
-`config.yaml` is excluded from Git because it contains a secret. Never put the token in source code, documentation, logs, or error messages.
+Click **Save** after making changes. The application stores the settings locally and loads them on the next launch. Never put the Telegram token in source code, documentation, logs, or error messages.
 
 ## Desktop Interface
 
@@ -136,11 +129,11 @@ It prints the model ID, bot username, and a short response excerpt, but never pr
 
 - **llama-server is unavailable:** check `http://127.0.0.1:8080/health` and the configured `llama_base_url`.
 - **The model list is empty:** make sure a model is loaded and `/v1/models` returns at least one item.
-- **The Telegram token is invalid:** issue a token through BotFather and store it only in `config.yaml`.
+- **The Telegram token is invalid:** issue a token through BotFather, enter it in the desktop interface, and click **Save**.
 - **tkinter is unavailable:** use a Python distribution that includes a working tkinter/Tcl/Tk installation.
 - **The response does not fit:** shorten the request, reduce the generation limit, or use `/reset`.
 - **The model cannot analyze images:** verify that `/props` reports the `vision` modality; a text-only model will not receive the attachment.
 - **The image is rejected:** send a photo or an `image/*` document no larger than 10 MiB.
 - **Access is denied:** check the Telegram user ID in `allowed_user_ids`; an empty list disables the restriction.
 
-Revoke any token that has ever been exposed in plain text through BotFather, then replace it with a new token in the local `config.yaml`.
+Revoke any token that has ever been exposed in plain text through BotFather, then enter the replacement token in the desktop interface and click **Save**.
