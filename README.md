@@ -1,5 +1,7 @@
 # Telegram Bot for a Local llama.cpp Server
 
+<img width="464" height="847" alt="ex" src="https://github.com/user-attachments/assets/0640982d-4d4a-44b6-8ff1-ce0b64524826" />
+
 This desktop application runs an aiogram-based Telegram bot and forwards text and images to an already running OpenAI-compatible llama-server. Settings are edited in a native tkinter interface, and the Start and Stop buttons control the bot without closing the GUI.
 
 ## Features
