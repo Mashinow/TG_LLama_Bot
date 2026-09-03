@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Self
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
 
 import tg_llama_bot.bot as bot_module
 from tg_llama_bot.bot import (
@@ -25,7 +26,6 @@ from tg_llama_bot.bot import (
     build_dispatcher,
     is_allowed,
     run_bot,
-    split_telegram_text,
 )
 from tg_llama_bot.history import HistoryStore, InputTooLongError
 from tg_llama_bot.llama_client import LlamaConnectionError
@@ -68,9 +68,11 @@ class FakeLlama:
         self,
         answer: str = "model answer",
         error: Exception | None = None,
+        tokens: list[str] | None = None,
     ) -> None:
         self.answer = answer
         self.error = error
+        self.tokens = tokens or [answer]
         self.completed_messages: list[list[ChatMessage]] = []
         self.exited = False
 
@@ -88,6 +90,18 @@ class FakeLlama:
             raise self.error
         return self.answer
 
+    async def stream_complete(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        max_tokens: int,
+    ):
+        self.completed_messages.append(list(messages))
+        if self.error is not None:
+            raise self.error
+        for token in self.tokens:
+            yield token
+
     async def discover(self) -> ServerCapabilities:
         return CAPABILITIES
 
@@ -103,9 +117,11 @@ class FakeService:
         self,
         answer: str = "model answer",
         error: Exception | None = None,
+        tokens: list[str] | None = None,
     ) -> None:
         self.answer_text = answer
         self.error = error
+        self.tokens = tokens or [answer]
         self.calls: list[tuple[int, str, tuple[ImageAttachment, ...]]] = []
 
     async def answer(
@@ -113,11 +129,15 @@ class FakeService:
         chat_id: int,
         text: str,
         images: tuple[ImageAttachment, ...] = (),
+        on_token=None,
     ) -> str:
         self.calls.append((chat_id, text, images))
         if self.error is not None:
             raise self.error
-        return self.answer_text
+        if on_token is not None:
+            for token in self.tokens:
+                await on_token(token)
+        return "".join(self.tokens)
 
 
 class FakeTelegramDownloader:
@@ -134,6 +154,19 @@ class FakeTelegramDownloader:
         return destination
 
 
+class FakeSentMessage:
+    def __init__(self, text: str, edit_errors: list[Exception] | None = None) -> None:
+        self.text = text
+        self.edits: list[str] = []
+        self.edit_errors = edit_errors or []
+
+    async def edit_text(self, text: str) -> None:
+        if self.edit_errors:
+            raise self.edit_errors.pop(0)
+        self.text = text
+        self.edits.append(text)
+
+
 class FakeMessage:
     def __init__(
         self,
@@ -145,6 +178,7 @@ class FakeMessage:
         photo: list[object] | None = None,
         document: object | None = None,
         bot: object | None = None,
+        edit_errors: list[Exception] | None = None,
     ) -> None:
         self.from_user = SimpleNamespace(id=user_id)
         self.chat = SimpleNamespace(id=chat_id)
@@ -154,9 +188,14 @@ class FakeMessage:
         self.document = document
         self.bot = bot or FakeTelegramDownloader()
         self.answers: list[str] = []
+        self.sent_messages: list[FakeSentMessage] = []
+        self.edit_errors = list(edit_errors or [])
 
-    async def answer(self, text: str) -> None:
+    async def answer(self, text: str) -> FakeSentMessage:
         self.answers.append(text)
+        sent = FakeSentMessage(text, self.edit_errors)
+        self.sent_messages.append(sent)
+        return sent
 
 
 def test_empty_allowlist_allows_everyone() -> None:
@@ -166,18 +205,6 @@ def test_empty_allowlist_allows_everyone() -> None:
 def test_populated_allowlist_rejects_unknown_user() -> None:
     assert is_allowed(7, (7, 9))
     assert not is_allowed(8, (7, 9))
-
-
-def test_split_prefers_paragraph_then_newline_boundaries() -> None:
-    text = "first paragraph\n\nsecond paragraph\nline"
-    parts = split_telegram_text(text, limit=20)
-    assert "".join(parts) == text
-    assert all(0 < len(part) <= 20 for part in parts)
-    assert parts[0] == "first paragraph\n\n"
-
-
-def test_split_uses_hard_boundary_for_unbroken_text() -> None:
-    assert split_telegram_text("abcdefgh", limit=3) == ["abc", "def", "gh"]
 
 
 @pytest.mark.asyncio
@@ -193,6 +220,20 @@ async def test_chat_service_commits_only_successful_exchange() -> None:
         ChatMessage("assistant", "model answer"),
         ChatMessage("user", "next"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_chat_service_forwards_stream_tokens_and_returns_full_answer() -> None:
+    llama = FakeLlama(tokens=["model ", "answer"])
+    service = ChatService(llama, CAPABILITIES, HistoryStore())
+    streamed: list[str] = []
+
+    async def on_token(token: str) -> None:
+        streamed.append(token)
+
+    result = await service.answer(10, "hello", on_token=on_token)
+    assert streamed == ["model ", "answer"]
+    assert result == "model answer"
 
 
 @pytest.mark.asyncio
@@ -260,12 +301,28 @@ async def test_reset_clears_only_current_chat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_long_answer_is_sent_as_multiple_messages() -> None:
-    service = FakeService(answer="x" * 5000)
+async def test_text_handler_edits_one_message_every_150_tokens() -> None:
+    service = FakeService(tokens=["x"] * 301)
     handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
     message = FakeMessage(user_id=7, chat_id=10)
     await handlers.text(message)
-    assert [len(part) for part in message.answers] == [4096, 904]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == ["x" * 150, "x" * 300, "x" * 301]
+
+
+@pytest.mark.asyncio
+async def test_progress_edit_failure_does_not_abort_generation() -> None:
+    service = FakeService(tokens=["x"] * 151)
+    edit_error = TelegramNetworkError(SimpleNamespace(), "offline")
+    message = FakeMessage(
+        user_id=7,
+        chat_id=10,
+        edit_errors=[edit_error],
+    )
+    handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
+    await handlers.text(message)
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == ["x" * 151]
 
 
 @pytest.mark.asyncio
@@ -287,7 +344,8 @@ async def test_text_handler_maps_model_errors_to_safe_messages(
     )
     message = FakeMessage(user_id=7, chat_id=10)
     await handlers.text(message)
-    assert message.answers == [expected]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [expected]
 
 
 @pytest.mark.asyncio
@@ -310,7 +368,31 @@ async def test_photo_with_caption_reaches_model_as_jpeg() -> None:
     assert service.calls == [
         (10, "Что изображено?", (ImageAttachment("image/jpeg", b"image-bytes"),))
     ]
-    assert message.answers == ["model answer"]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == ["model answer"]
+
+
+@pytest.mark.asyncio
+async def test_image_placeholder_is_sent_before_download() -> None:
+    message: FakeMessage | None = None
+
+    class PlaceholderCheckingDownloader(FakeTelegramDownloader):
+        async def download(self, downloadable: object, *, destination) -> object:
+            assert message is not None
+            assert message.answers == ["..."]
+            return await super().download(downloadable, destination=destination)
+
+    downloader = PlaceholderCheckingDownloader()
+    message = FakeMessage(
+        user_id=7,
+        chat_id=10,
+        text=None,
+        photo=[SimpleNamespace(file_id="photo", file_size=11)],
+        bot=downloader,
+    )
+    handlers = BotHandlers(AppConfig("token"), FakeService(), HistoryStore())
+    await handlers.image(message)
+    assert message.sent_messages[0].edits == ["model answer"]
 
 
 @pytest.mark.asyncio
@@ -364,7 +446,8 @@ async def test_reported_oversized_image_is_rejected_before_download() -> None:
     await handlers.image(message)
     assert downloader.calls == []
     assert service.calls == []
-    assert message.answers == [IMAGE_TOO_LARGE_TEXT]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [IMAGE_TOO_LARGE_TEXT]
 
 
 @pytest.mark.asyncio
@@ -381,7 +464,8 @@ async def test_downloaded_oversized_image_is_rejected() -> None:
     handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
     await handlers.image(message)
     assert service.calls == []
-    assert message.answers == [IMAGE_TOO_LARGE_TEXT]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [IMAGE_TOO_LARGE_TEXT]
 
 
 @pytest.mark.asyncio
@@ -398,7 +482,8 @@ async def test_empty_downloaded_image_is_rejected() -> None:
     handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
     await handlers.image(message)
     assert service.calls == []
-    assert message.answers == [IMAGE_DOWNLOAD_ERROR_TEXT]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [IMAGE_DOWNLOAD_ERROR_TEXT]
 
 
 @pytest.mark.asyncio
@@ -417,7 +502,8 @@ async def test_non_image_document_is_unsupported() -> None:
     handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
     await handlers.image(message)
     assert service.calls == []
-    assert message.answers == [UNSUPPORTED_TEXT]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [UNSUPPORTED_TEXT]
 
 
 @pytest.mark.asyncio
@@ -441,7 +527,8 @@ async def test_image_handler_maps_model_errors_to_safe_messages(
     )
     handlers = BotHandlers(AppConfig("token"), service, HistoryStore())
     await handlers.image(message)
-    assert message.answers == [expected]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [expected]
 
 
 @pytest.mark.asyncio
@@ -456,7 +543,8 @@ async def test_image_download_failure_returns_safe_message() -> None:
     )
     handlers = BotHandlers(AppConfig("token"), FakeService(), HistoryStore())
     await handlers.image(message)
-    assert message.answers == [IMAGE_DOWNLOAD_ERROR_TEXT]
+    assert message.answers == ["..."]
+    assert message.sent_messages[0].edits == [IMAGE_DOWNLOAD_ERROR_TEXT]
 
 
 def test_dispatcher_registers_image_before_text_and_fallback() -> None:

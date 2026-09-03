@@ -1,7 +1,8 @@
 import asyncio
 import base64
+import json
 import random
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -151,6 +152,74 @@ class LlamaClient:
             raise LlamaProtocolError("llama-server вернул пустой ответ.")
         return content
 
+    async def stream_complete(
+        self,
+        model_id: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+    ) -> AsyncIterator[str]:
+        has_content = False
+        delivered_content = False
+        finished = False
+
+        def retry_allowed() -> bool:
+            return not delivered_content
+
+        async for line in self._stream_lines(
+            "POST",
+            "/v1/chat/completions",
+            payload={
+                "model": model_id,
+                "messages": [self._serialize_message(message) for message in messages],
+                "max_tokens": max_tokens,
+                "stream": True,
+            },
+            retry_allowed=retry_allowed,
+        ):
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                finished = True
+                break
+            try:
+                payload = json.loads(data)
+            except ValueError as exc:
+                raise LlamaProtocolError(
+                    "llama-server вернул невалидное событие SSE."
+                ) from exc
+            if not isinstance(payload, dict):
+                raise LlamaProtocolError("llama-server вернул событие SSE неверного типа.")
+            choices = payload.get("choices")
+            if choices == []:
+                continue
+            if (
+                not isinstance(choices, list)
+                or not choices
+                or not isinstance(choices[0], dict)
+            ):
+                raise LlamaProtocolError("llama-server не вернул потоковый вариант ответа.")
+            delta = choices[0].get("delta")
+            if not isinstance(delta, dict):
+                raise LlamaProtocolError("llama-server вернул некорректный потоковый ответ.")
+            content = delta.get("content")
+            if content is None:
+                continue
+            if not isinstance(content, str):
+                raise LlamaProtocolError("llama-server вернул потоковый текст неверного типа.")
+            if not content:
+                continue
+            delivered_content = True
+            has_content = has_content or bool(content.strip())
+            yield content
+
+        if not finished:
+            raise LlamaProtocolError("Поток llama-server завершился без маркера [DONE].")
+        if not has_content:
+            raise LlamaProtocolError("llama-server вернул пустой ответ.")
+
     @staticmethod
     def _serialize_message(message: ChatMessage) -> dict[str, Any]:
         if not message.images:
@@ -219,6 +288,42 @@ class LlamaClient:
             return response
 
         raise AssertionError("retry loop exhausted unexpectedly")
+
+    async def _stream_lines(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any],
+        retry_allowed: Callable[[], bool],
+    ) -> AsyncIterator[str]:
+        attempts = max(1, self._retry_policy.attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self._http.stream(method, path, json=payload) as response:
+                    if response.status_code in {408, 429} or response.status_code >= 500:
+                        if attempt == attempts:
+                            raise LlamaConnectionError(
+                                "llama-server временно недоступен "
+                                f"(HTTP {response.status_code})."
+                            )
+                        await self._wait_before_retry(attempt)
+                        continue
+                    if response.status_code >= 400:
+                        raise LlamaInputError(
+                            f"llama-server отклонил запрос (HTTP {response.status_code})."
+                        )
+                    async for line in response.aiter_lines():
+                        yield line
+                    return
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if not retry_allowed() or attempt == attempts:
+                    raise LlamaConnectionError(
+                        "Потоковое соединение с llama-server было прервано."
+                    ) from exc
+                await self._wait_before_retry(attempt)
+
+        raise AssertionError("stream retry loop exhausted unexpectedly")
 
     async def _wait_before_retry(self, attempt: int) -> None:
         exponential = self._retry_policy.base_delay * 2 ** (attempt - 1)

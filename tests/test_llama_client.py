@@ -13,6 +13,12 @@ from tg_llama_bot.llama_client import (
 from tg_llama_bot.models import ChatMessage, ImageAttachment
 
 
+class DisconnectAfterMetadata(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        raise httpx.ReadError("stream disconnected")
+
+
 @pytest.mark.asyncio
 async def test_discover_selects_first_model_and_server_properties() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -168,6 +174,128 @@ async def test_complete_sends_chat_contract_and_returns_content() -> None:
         128,
     )
     assert answer == "answer"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_yields_each_llama_server_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content) == {
+            "model": "model.gguf",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 128,
+            "stream": True,
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+        )
+
+    http = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = LlamaClient("http://test", http_client=http)
+    chunks = [
+        chunk
+        async for chunk in client.stream_complete(
+            "model.gguf",
+            [ChatMessage("user", "hello")],
+            128,
+        )
+    ]
+    assert chunks == ["Hel", "lo"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_rejects_empty_content() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: [DONE]\n\n",
+        )
+
+    http = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = LlamaClient("http://test", http_client=http)
+    with pytest.raises(LlamaProtocolError):
+        _ = [chunk async for chunk in client.stream_complete("model.gguf", [], 32)]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_rejects_eof_before_done_marker() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text='data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        )
+
+    http = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = LlamaClient("http://test", http_client=http)
+    with pytest.raises(LlamaProtocolError):
+        _ = [
+            chunk
+            async for chunk in client.stream_complete("model.gguf", [], 32)
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_retries_if_no_content_was_delivered() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=DisconnectAfterMetadata(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+        )
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    http = httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = LlamaClient(
+        "http://test",
+        http_client=http,
+        retry_policy=RetryPolicy(attempts=2, base_delay=0.0, max_delay=0.0),
+        sleep=fake_sleep,
+        jitter=lambda low, high: 0.0,
+    )
+    chunks = [
+        chunk async for chunk in client.stream_complete("model.gguf", [], 32)
+    ]
+    assert chunks == ["answer"]
+    assert attempts == 2
     await client.aclose()
 
 

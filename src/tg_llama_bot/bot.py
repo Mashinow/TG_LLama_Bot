@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from io import BytesIO
 
@@ -38,34 +39,16 @@ VISION_UNAVAILABLE_TEXT = "Текущая модель не поддержива
 IMAGE_TOO_LARGE_TEXT = "Изображение слишком большое. Максимальный размер — 10 МиБ."
 IMAGE_DOWNLOAD_ERROR_TEXT = "Не удалось загрузить изображение. Попробуйте отправить его снова."
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+PENDING_TEXT = "..."
+STREAM_EDIT_INTERVAL_TOKENS = 150
+
+TokenSink = Callable[[str], Awaitable[None]]
 
 
 def is_allowed(user_id: int | None, allowed_user_ids: tuple[int, ...]) -> bool:
     if user_id is None:
         return False
     return not allowed_user_ids or user_id in allowed_user_ids
-
-
-def split_telegram_text(text: str, limit: int = 4096) -> list[str]:
-    if limit <= 0:
-        raise ValueError("Telegram message limit must be positive.")
-    parts: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n\n", 0, limit + 1)
-        if split_at >= 0:
-            split_at += 2
-        else:
-            split_at = remaining.rfind("\n", 0, limit + 1)
-            if split_at >= 0:
-                split_at += 1
-        if split_at <= 0:
-            split_at = limit
-        parts.append(remaining[:split_at])
-        remaining = remaining[split_at:]
-    if remaining:
-        parts.append(remaining)
-    return parts
 
 
 class ChatService:
@@ -84,6 +67,7 @@ class ChatService:
         chat_id: int,
         text: str,
         images: tuple[ImageAttachment, ...] = (),
+        on_token: TokenSink | None = None,
     ) -> str:
         if images and "vision" not in self._capabilities.modalities:
             raise VisionUnavailableError
@@ -100,11 +84,16 @@ class ChatService:
                 prompt_budget,
                 images,
             )
-            answer = await self._llama.complete(
+            chunks: list[str] = []
+            async for token in self._llama.stream_complete(
                 self._capabilities.model_id,
                 messages,
                 self._capabilities.max_output_tokens,
-            )
+            ):
+                chunks.append(token)
+                if on_token is not None:
+                    await on_token(token)
+            answer = "".join(chunks)
             self._history.commit(chat_id, text, answer, images)
             return answer
 
@@ -140,20 +129,12 @@ class BotHandlers:
         if not isinstance(message.text, str):
             await message.answer(UNSUPPORTED_TEXT)
             return
-        try:
-            answer = await self._service.answer(message.chat.id, message.text)
-        except InputTooLongError:
-            await message.answer(INPUT_TOO_LONG_TEXT)
-            return
-        except LlamaError:
-            await message.answer(UPSTREAM_ERROR_TEXT)
-            return
-        for part in split_telegram_text(answer):
-            await message.answer(part)
+        await self._answer_with_progress(message, message.text)
 
     async def image(self, message: Message) -> None:
         if not await self._authorize(message):
             return
+        pending = await message.answer(PENDING_TEXT)
 
         downloadable: object | None = None
         media_type: str | None = None
@@ -169,27 +150,27 @@ class BotHandlers:
                 media_type = document_media_type
 
         if downloadable is None or media_type is None:
-            await message.answer(UNSUPPORTED_TEXT)
+            await pending.edit_text(UNSUPPORTED_TEXT)
             return
 
         reported_size = getattr(downloadable, "file_size", None)
         if isinstance(reported_size, int) and reported_size > MAX_IMAGE_BYTES:
-            await message.answer(IMAGE_TOO_LARGE_TEXT)
+            await pending.edit_text(IMAGE_TOO_LARGE_TEXT)
             return
 
         destination = BytesIO()
         try:
             await message.bot.download(downloadable, destination=destination)
         except (TelegramAPIError, OSError):
-            await message.answer(IMAGE_DOWNLOAD_ERROR_TEXT)
+            await pending.edit_text(IMAGE_DOWNLOAD_ERROR_TEXT)
             return
 
         image_data = destination.getvalue()
         if len(image_data) > MAX_IMAGE_BYTES:
-            await message.answer(IMAGE_TOO_LARGE_TEXT)
+            await pending.edit_text(IMAGE_TOO_LARGE_TEXT)
             return
         if not image_data:
-            await message.answer(IMAGE_DOWNLOAD_ERROR_TEXT)
+            await pending.edit_text(IMAGE_DOWNLOAD_ERROR_TEXT)
             return
 
         prompt = (
@@ -197,27 +178,62 @@ class BotHandlers:
             if isinstance(message.caption, str) and message.caption.strip()
             else DEFAULT_IMAGE_PROMPT
         )
-        try:
-            answer = await self._service.answer(
-                message.chat.id,
-                prompt,
-                images=(ImageAttachment(media_type, image_data),),
-            )
-        except VisionUnavailableError:
-            await message.answer(VISION_UNAVAILABLE_TEXT)
-            return
-        except InputTooLongError:
-            await message.answer(INPUT_TOO_LONG_TEXT)
-            return
-        except LlamaError:
-            await message.answer(UPSTREAM_ERROR_TEXT)
-            return
-        for part in split_telegram_text(answer):
-            await message.answer(part)
+        await self._answer_with_progress(
+            message,
+            prompt,
+            images=(ImageAttachment(media_type, image_data),),
+            pending=pending,
+        )
 
     async def unsupported(self, message: Message) -> None:
         if await self._authorize(message):
             await message.answer(UNSUPPORTED_TEXT)
+
+    async def _answer_with_progress(
+        self,
+        message: Message,
+        text: str,
+        images: tuple[ImageAttachment, ...] = (),
+        pending: Message | None = None,
+    ) -> None:
+        if pending is None:
+            pending = await message.answer(PENDING_TEXT)
+        chunks: list[str] = []
+        token_count = 0
+        rendered_text = PENDING_TEXT
+
+        async def on_token(token: str) -> None:
+            nonlocal token_count, rendered_text
+            chunks.append(token)
+            token_count += 1
+            if token_count % STREAM_EDIT_INTERVAL_TOKENS == 0:
+                current_text = "".join(chunks)
+                if current_text != rendered_text:
+                    try:
+                        await pending.edit_text(current_text)
+                    except TelegramAPIError:
+                        return
+                    rendered_text = current_text
+
+        try:
+            answer = await self._service.answer(
+                message.chat.id,
+                text,
+                images=images,
+                on_token=on_token,
+            )
+        except VisionUnavailableError:
+            await pending.edit_text(VISION_UNAVAILABLE_TEXT)
+            return
+        except InputTooLongError:
+            await pending.edit_text(INPUT_TOO_LONG_TEXT)
+            return
+        except LlamaError:
+            await pending.edit_text(UPSTREAM_ERROR_TEXT)
+            return
+
+        if answer != rendered_text:
+            await pending.edit_text(answer)
 
     async def _authorize(self, message: Message) -> bool:
         user_id = message.from_user.id if message.from_user is not None else None
